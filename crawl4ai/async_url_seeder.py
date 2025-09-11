@@ -28,9 +28,10 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 from urllib.parse import quote, urljoin
-
+from PyPDF2 import PdfReader
 import httpx
 import fnmatch
+from .utils import is_pdf_url
 try:
     from lxml import html as lxml_html
     from lxml import etree
@@ -979,19 +980,36 @@ class AsyncUrlSeeder:
                 return
 
         if extract:
-            self._log("debug", "Fetching head for {url}", params={
-                      "url": url}, tag="URL_SEED")
-            ok, html, final = await self._fetch_head(url, timeout)
-            status = "valid" if ok else "not_valid"
-            self._log("info" if ok else "warning", "HEAD {status} for {final_url}",
-                      params={"status": status.upper(), "final_url": final or url}, tag="URL_SEED")
-            # head_data = _parse_head(html) if ok else {}
-            head_data = await asyncio.to_thread(_parse_head, html) if ok else {}
-            entry = {
-                "url": final or url,
-                "status": status,
-                "head_data": head_data,
-            }
+
+            is_pdf = is_pdf_url(url)
+            self._log("debug", "URL {url} is PDF: {is_pdf}", params={"url": url, "is_pdf": is_pdf}, tag="URL_SEED")
+
+
+
+            if is_pdf:
+                # ── PDF handling ──────────────────────────────────────────────
+                ok, title, final = await self._fetch_pdf_title(url, timeout)
+                status = "valid" if ok else "not_valid"
+                head_data = {"title": title} if ok and title else {}
+                entry = {
+                    "url": final or url,
+                    "status": status,
+                    "head_data": head_data,
+                }
+            else:
+                # ── HTML/other handling (existing logic) ─────────────────────
+                self._log("debug", "Fetching head for {url}", params={
+                          "url": url}, tag="URL_SEED")
+                ok, html, final = await self._fetch_head(url, timeout)
+                status = "valid" if ok else "not_valid"
+                self._log("info" if ok else "warning", "HEAD {status} for {final_url}",
+                          params={"status": status.upper(), "final_url": final or url}, tag="URL_SEED")
+                head_data = await asyncio.to_thread(_parse_head, html) if ok else {}
+                entry = {
+                    "url": final or url,
+                    "status": status,
+                    "head_data": head_data,
+                }
 
         elif live:
             self._log("debug", "Performing live check for {url}", params={
@@ -1138,6 +1156,65 @@ class AsyncUrlSeeder:
         self._log("warning", "Exceeded max redirects ({max_redirects}) for {url}",
                   params={"max_redirects": max_redirects, "url": url}, tag="URL_SEED")
         return False, "", url
+
+    
+    async def _fetch_pdf_title(
+        self,
+        url: str,
+        timeout: int,
+        max_bytes: int = 2_000_000,
+    ) -> Tuple[bool, str, str]:
+        """
+        下载 PDF 的前 `max_bytes` 字节并尝试抽取首页首行文字。
+
+        Returns
+        -------
+        ok : bool
+            是否成功抽取到文字
+        title : str
+            首页首行（去掉首尾空白）；若失败则为空串
+        final_url : str
+            处理完重定向后的最终 URL
+        """
+
+        self._log("debug", "Start fetching PDF {url}", params={"url": url},tag="URL_SEED")
+        self._log("debug", "Requesting first {bytes} bytes with Range header", params={"bytes": max_bytes})
+        # 1) 只拉首块，节省带宽 / 提前返回
+        resp = await self.client.get(
+            url,
+            follow_redirects=True,
+            timeout=timeout,
+            headers={
+                "Range": f"bytes=0-{max_bytes-1}",
+                # 额外 Accept-Encoding 确保不被 gzip 压缩
+                "Accept-Encoding": "identity",
+            },
+        )
+        self._log("debug", "Received response: status={status}", params={"status": resp.status_code})
+        resp.raise_for_status()
+        data = resp.content
+        self._log("debug", "Downloaded {size} bytes, final_url={final_url}", params={"size": len(data), "final_url": str(resp.url)})
+        final_url = str(resp.url)
+
+        # 2) 尝试解析首页文字
+        try:
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            self._log("debug", "PDF loaded: pages={pages}", params={"pages": len(reader.pages)})
+            page0 = reader.pages[0]
+            text = page0.extract_text() or ""
+            self._log("debug", "Extracted text length={length}", params={"length": len(text)})
+
+            
+            return True, text, final_url
+
+            # 可能首页是纯图片或空白
+            self._log("warning", "No text found on first page, returning empty title", tag="PDF_PARSE")
+            return False, "", final_url
+
+        except Exception as e:  # 解析器炸了 / 文档结构异常
+            self._log("error", "PDF parse failed: {err}", params={"err": str(e)}, tag="PDF_PARSE_ERROR")
+            self._log("warning", "No text found on first page, returning empty title", tag="PDF_PARSE")
+            return False, "", final_url
 
     # ─────────────────────────────── BM25 scoring helpers
     def _extract_text_context(self, head_data: Dict[str, Any]) -> str:
@@ -1357,7 +1434,7 @@ class AsyncUrlSeeder:
         
         # 10. Common non-content paths
         non_content_paths = [
-            '/wp-admin', '/wp-includes', '/wp-content/uploads',
+            '/wp-admin', '/wp-includes', 
             '/admin', '/login', '/signin', '/signup', '/register',
             '/checkout', '/cart', '/account', '/profile',
             '/search', '/404', '/error',

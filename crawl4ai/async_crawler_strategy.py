@@ -21,7 +21,7 @@ from .async_logger import AsyncLogger
 from .ssl_certificate import SSLCertificate
 from .user_agent_generator import ValidUAGenerator
 from .browser_manager import BrowserManager
-
+from .utils import is_pdf_url
 import aiofiles
 import aiohttp
 import chardet
@@ -507,6 +507,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         Returns:
             AsyncCrawlResponse: The response containing HTML, headers, status code, and optional data
         """
+        if is_pdf_url(url):
+            if self.logger:
+                self.logger.info(f"Converting PDF URL {url} to Jina.ai reader URL")
+            url = 'https://r.jina.ai/'+url
         config.url = url
         response_headers = {}
         execution_result = None

@@ -14,10 +14,9 @@ import pickle
 import os
 import json
 import math
-from collections import defaultdict, Counter
+from collections import defaultdict
 import re
 from pathlib import Path
-
 from crawl4ai.async_webcrawler import AsyncWebCrawler
 from crawl4ai.async_configs import CrawlerRunConfig, LinkPreviewConfig
 from crawl4ai.models import Link, CrawlResult
@@ -149,9 +148,11 @@ class CrawlState:
             metadata=d.get('metadata', {})
         )
 
-
+from re import Pattern
 @dataclass
 class AdaptiveConfig:
+
+    exclude_pattern: Optional[Pattern[str]] = None
     """Configuration for adaptive crawling"""
     confidence_threshold: float = 0.7
     max_depth: int = 5
@@ -593,13 +594,14 @@ class StatisticalStrategy(CrawlStrategy):
 class EmbeddingStrategy(CrawlStrategy):
     """Embedding-based adaptive crawling using semantic space coverage"""
     
-    def __init__(self, embedding_model: str = None, llm_config: Dict = None):
+    def __init__(self, logger, embedding_model: str = None, llm_config: Dict = None, exclude_pattern: Pattern[str] = None):
         self.embedding_model = embedding_model or "sentence-transformers/all-MiniLM-L6-v2"
         self.llm_config = llm_config
         self._embedding_cache = {}
         self._link_embedding_cache = {}  # Cache for link embeddings
         self._validation_passed = False  # Track if validation passed
-        
+        self.logger = logger
+        self.exclude_pattern = exclude_pattern
         # Performance optimization caches
         self._distance_matrix_cache = None  # Cache for query-KB distances
         self._kb_embeddings_hash = None  # Track KB changes
@@ -663,53 +665,53 @@ class EmbeddingStrategy(CrawlStrategy):
             
         return self._distance_matrix_cache
         
-    async def map_query_semantic_space(self, query: str, n_synthetic: int = 10) -> Any:
+    async def map_query_semantic_space(self, query: str, logger,n_synthetic: int = 10) -> Any:
         """Generate a point cloud representing the semantic neighborhood of the query"""
         from .utils import perform_completion_with_backoff
         
+        
         # Generate more variations than needed for train/val split
-        n_total = int(n_synthetic * 1.3)  # Generate 30% more for validation
-        
+        # n_total = int(n_synthetic * 1.3)  # Generate 30% more for validation
+
         # Generate variations using LLM
-        prompt = f"""Generate {n_total} variations of this query that explore different aspects: '{query}'
-        
-        These should be queries a user might ask when looking for similar information.
-        Include different phrasings, related concepts, and specific aspects.
-        
-        Return as a JSON array of strings."""
-        
+        # prompt = f"""Generate {n_total} variations of this query that explore different aspects: '{query}'
+
+        # These should be queries a user might ask when looking for similar information.
+        # Include different phrasings, related concepts, and specific aspects.
+
+        # Return as a JSON array of strings."""
+
         # Use the LLM for query generation
-        provider = self.llm_config.get('provider', 'openai/gpt-4o-mini') if self.llm_config else 'openai/gpt-4o-mini'
-        api_token = self.llm_config.get('api_token') if self.llm_config else None
-        
+        # provider = self.llm_config.get('provider', 'openai/gpt-4o-mini') if self.llm_config else 'openai/gpt-4o-mini'
+        # api_token = self.llm_config.get('api_token') if self.llm_config else None
+
         # response = perform_completion_with_backoff(
-        #     provider=provider,
+        #     provider='openai/gpt-4o-mini',
         #     prompt_with_variables=prompt,
         #     api_token=api_token,
         #     json_response=True
         # )
-        
+
+        # Convert response to variations dict
         # variations = json.loads(response.choices[0].message.content)
-        
-        
-        # # Mock data with more variations for split
-        variations ={'queries': ['what are the best vegetables to use in fried rice?', 'how do I make vegetable fried rice from scratch?', 'can you provide a quick recipe for vegetable fried rice?', 'what cooking techniques are essential for perfect fried rice with vegetables?', 'how to add flavor to vegetable fried rice?', 'are there any tips for making healthy fried rice with vegetables?']}
-        
-        
-        # variations = {'queries': [
-        #     'How do async and await work with coroutines in Python?',
-        #     'What is the role of event loops in asynchronous programming?',
-        #     'Can you explain the differences between async/await and traditional callback methods?',
-        #     'How do coroutines interact with event loops in JavaScript?',
-        #     'What are the benefits of using async await over promises in Node.js?',
-        #     'How to manage multiple coroutines with an event loop?',
-        #     'What are some common pitfalls when using async await with coroutines?',
-        #     'How do different programming languages implement async await and event loops?',
-        #     'What happens when an async function is called without await?',
-        #     'How does the event loop handle blocking operations?',
-        #     'Can you nest async functions and how does that affect the event loop?',
-        #     'What is the performance impact of using async/await?'
-        # ]}
+        # Store in cache for future reuse
+        # logger.info(repr(variations['queries']),tag="EMBEDDING")
+    
+        variations = {'queries': [
+            "What are the prerequisites for master's degree programs?",
+            'Can you provide details on admission criteria for graduate programs?', 
+            "What courses do I need to complete before applying for a master's program?", 
+            "How do I find admission requirements for various master's degrees?", 
+            "What are the eligibility criteria for enrolling in a master's program?", 
+            "Are there specific course requirements for different master's programs?", 
+            'What information is available about graduate program admissions?', 
+            "How can I learn about the application process for master's degrees?", 
+            "What documents are needed for admission to a master's program?", 
+            "What are the academic requirements for applying to a master's program?", 
+            "Do master's programs have specific course prerequisites?", 
+            'Where can I find information on graduate school admission requirements?', 
+            "What steps should I take to prepare for applying to a master's program?"
+        ]}
         
         # Split into train and validation
         # all_queries = [query] + variations['queries']
@@ -800,7 +802,8 @@ class EmbeddingStrategy(CrawlStrategy):
             gaps.append((q_emb, min_distances[i]))
                 
         return gaps
-        
+
+
     async def select_links_for_expansion(
         self, 
         candidate_links: List[Link], 
@@ -830,7 +833,11 @@ class EmbeddingStrategy(CrawlStrategy):
             
             if not link_text.strip():
                 continue
-            
+            # 如果含有本科相关信息,排除
+            if self.exclude_pattern and self.exclude_pattern.search(link_text):
+                self.logger.info(f"Skipping link: {link.href} - contains undergraduate information",tag="EMBEDDING")
+                continue
+
             # Create cache key from URL + text content
             cache_key = hashlib.md5(f"{link.href}:{link_text}".encode()).hexdigest()
             
@@ -1234,10 +1241,13 @@ class AdaptiveCrawler:
     def __init__(self, 
                  crawler: Optional[AsyncWebCrawler] = None,
                  config: Optional[AdaptiveConfig] = None,
-                 strategy: Optional[CrawlStrategy] = None):
+                 strategy: Optional[CrawlStrategy] = None,
+                 crawler_run_config: Optional[CrawlerRunConfig] = None):
         self.crawler = crawler
+        self.crawler_run_config = crawler_run_config
         self.config = config or AdaptiveConfig()
         self.config.validate()
+        self.exclude_pattern = config.exclude_pattern
         
         # Create strategy based on config
         if strategy:
@@ -1257,8 +1267,10 @@ class AdaptiveCrawler:
             return StatisticalStrategy()
         elif strategy_name == "embedding":
             return EmbeddingStrategy(
+                logger=self.crawler.logger,
                 embedding_model=self.config.embedding_model,
-                llm_config=self.config.embedding_llm_config
+                llm_config=self.config.embedding_llm_config,
+                exclude_pattern=self.exclude_pattern
             )
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
@@ -1293,6 +1305,7 @@ class AdaptiveCrawler:
             # Generate query space
             query_embeddings, expanded_queries = await self.strategy.map_query_semantic_space(
                 query, 
+                self.crawler.logger,
                 self.config.n_query_variations
             )
             self.state.query_embeddings = query_embeddings
@@ -1411,10 +1424,15 @@ class AdaptiveCrawler:
     
     async def _crawl_with_preview(self, url: str, query: str) -> Optional[CrawlResult]:
         """Crawl a URL with link preview enabled"""
-        config = CrawlerRunConfig(
+        config=self.crawler_run_config
+        if config :
+            config.link_preview_config.query=query
+        else:
+            config = CrawlerRunConfig(
             link_preview_config=LinkPreviewConfig(
                 include_internal=True,
                 include_external=False,
+                
                 query=query,  # For BM25 scoring
                 concurrency=5,
                 timeout=5,
@@ -1422,7 +1440,7 @@ class AdaptiveCrawler:
                 verbose=False
             ),
             score_links=True  # Enable intrinsic scoring
-        )
+            )
         
         try:
             result = await self.crawler.arun(url=url, config=config)

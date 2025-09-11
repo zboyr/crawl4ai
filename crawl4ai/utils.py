@@ -2391,7 +2391,8 @@ def is_external_url(url: str, base_domain: str) -> bool:
         parsed = urlparse(url)
         if not parsed.netloc:  # Relative URL
             return False
-
+        elif parsed.netloc == "r.jina.ai":
+            return False
         # Strip 'www.' from both domains for comparison
         url_domain = parsed.netloc.lower().replace("www.", "")
         base = base_domain.lower().replace("www.", "")
@@ -3387,3 +3388,7 @@ def cosine_distance(vec1: np.ndarray, vec2: np.ndarray) -> float:
     """Calculate cosine distance (1 - similarity) between two vectors"""
     return 1 - cosine_similarity(vec1, vec2)
 
+
+def is_pdf_url(url: str) -> bool:
+    parsed = urlparse(url.lower())
+    return parsed.path.endswith('.pdf')

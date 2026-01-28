@@ -1,5 +1,7 @@
+import importlib
 import os
-from typing import Union
+import warnings
+import requests
 from .config import (
     DEFAULT_PROVIDER,
     DEFAULT_PROVIDER_API_KEY,
@@ -25,13 +27,13 @@ from .table_extraction import TableExtractionStrategy, DefaultTableExtraction
 from .cache_context import CacheMode
 from .proxy_strategy import ProxyRotationStrategy
 
-from typing import Union, List, Callable
 import inspect
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 from enum import Enum
 
 # Type alias for URL matching
 UrlMatcher = Union[str, Callable[[str], bool], List[Union[str, Callable[[str], bool]]]]
+
 
 class MatchMode(Enum):
     OR = "or"
@@ -40,8 +42,7 @@ class MatchMode(Enum):
 # from .proxy_strategy import ProxyConfig
 
 
-
-def to_serializable_dict(obj: Any, ignore_default_value : bool = False) -> Dict:
+def to_serializable_dict(obj: Any, ignore_default_value : bool = False):
     """
     Recursively convert an object to a serializable dictionary using {type, params} structure
     for complex objects.
@@ -97,16 +98,17 @@ def to_serializable_dict(obj: Any, ignore_default_value : bool = False) -> Dict:
                 if value != param.default and not ignore_default_value:
                     current_values[name] = to_serializable_dict(value)
         
-        if hasattr(obj, '__slots__'):
-            for slot in obj.__slots__:
-                if slot.startswith('_'):  # Handle private slots
-                    attr_name = slot[1:]  # Remove leading '_'
-                    value = getattr(obj, slot, None)
-                    if value is not None:
-                        current_values[attr_name] = to_serializable_dict(value)
+        # Don't serialize private __slots__ - they're internal implementation details
+        # not constructor parameters. This was causing URLPatternFilter to fail
+        # because _simple_suffixes was being serialized as 'simple_suffixes'
+        # if hasattr(obj, '__slots__'):
+        #     for slot in obj.__slots__:
+        #         if slot.startswith('_'):  # Handle private slots
+        #             attr_name = slot[1:]  # Remove leading '_'
+        #             value = getattr(obj, slot, None)
+        #             if value is not None:
+        #                 current_values[attr_name] = to_serializable_dict(value)
 
-            
-        
         return {
             "type": obj.__class__.__name__,
             "params": current_values
@@ -132,12 +134,20 @@ def from_serializable_dict(data: Any) -> Any:
         if data["type"] == "dict" and "value" in data:
             return {k: from_serializable_dict(v) for k, v in data["value"].items()}
 
-        # Import from crawl4ai for class instances
-        import crawl4ai
+        cls = None
+        # If you are receiving an error while trying to convert a dict to an object:
+        # Either add a module to `modules_paths` list, or add the `data["type"]` to the crawl4ai __init__.py file
+        module_paths = ["crawl4ai"]
+        for module_path in module_paths:
+            try:
+                mod = importlib.import_module(module_path)
+                if hasattr(mod, data["type"]):
+                    cls = getattr(mod, data["type"])
+                    break
+            except (ImportError, AttributeError):
+                continue
 
-        if hasattr(crawl4ai, data["type"]):
-            cls = getattr(crawl4ai, data["type"])
-
+        if cls is not None:
             # Handle Enum
             if issubclass(cls, Enum):
                 return cls(data["params"])
@@ -254,24 +264,39 @@ class ProxyConfig:
     
     @staticmethod
     def from_string(proxy_str: str) -> "ProxyConfig":
-        """Create a ProxyConfig from a string in the format 'ip:port:username:password'."""
-        parts = proxy_str.split(":")
-        if len(parts) == 4:  # ip:port:username:password
+        """Create a ProxyConfig from a string.
+
+        Supported formats:
+        - 'http://username:password@ip:port'
+        - 'http://ip:port'
+        - 'socks5://ip:port'
+        - 'ip:port:username:password'
+        - 'ip:port'
+        """
+        s = (proxy_str or "").strip()
+        # URL with credentials
+        if "@" in s and "://" in s:
+            auth_part, server_part = s.split("@", 1)
+            protocol, credentials = auth_part.split("://", 1)
+            if ":" in credentials:
+                username, password = credentials.split(":", 1)
+                return ProxyConfig(
+                    server=f"{protocol}://{server_part}",
+                    username=username,
+                    password=password,
+                )
+        # URL without credentials (keep scheme)
+        if "://" in s and "@" not in s:
+            return ProxyConfig(server=s)
+        # Colon separated forms
+        parts = s.split(":")
+        if len(parts) == 4:
             ip, port, username, password = parts
-            return ProxyConfig(
-                server=f"http://{ip}:{port}",
-                username=username,
-                password=password,
-                ip=ip
-            )
-        elif len(parts) == 2:  # ip:port only
+            return ProxyConfig(server=f"http://{ip}:{port}", username=username, password=password)
+        if len(parts) == 2:
             ip, port = parts
-            return ProxyConfig(
-                server=f"http://{ip}:{port}",
-                ip=ip
-            )
-        else:
-            raise ValueError(f"Invalid proxy string format: {proxy_str}")
+            return ProxyConfig(server=f"http://{ip}:{port}")
+        raise ValueError(f"Invalid proxy string format: {proxy_str}")
     
     @staticmethod
     def from_dict(proxy_dict: Dict) -> "ProxyConfig":
@@ -348,6 +373,20 @@ class BrowserConfig:
         use_managed_browser (bool): Launch the browser using a managed approach (e.g., via CDP), allowing
                                     advanced manipulation. Default: False.
         cdp_url (str): URL for the Chrome DevTools Protocol (CDP) endpoint. Default: "ws://localhost:9222/devtools/browser/".
+        browser_context_id (str or None): Pre-existing CDP browser context ID to use. When provided along with
+                                          cdp_url, the crawler will reuse this context instead of creating a new one.
+                                          Useful for cloud browser services that pre-create isolated contexts.
+                                          Default: None.
+        target_id (str or None): Pre-existing CDP target ID (page) to use. When provided along with
+                                 browser_context_id, the crawler will reuse this target instead of creating
+                                 a new page. Default: None.
+        cdp_cleanup_on_close (bool): When True and using cdp_url, the close() method will still clean up
+                                     the local Playwright client resources. Useful for cloud/server scenarios
+                                     where you don't own the remote browser but need to prevent memory leaks
+                                     from accumulated Playwright instances. Default: False.
+        create_isolated_context (bool): When True and using cdp_url, forces creation of a new browser context
+                                        instead of reusing the default context. Essential for concurrent crawls
+                                        on the same browser to prevent navigation conflicts. Default: False.
         debugging_port (int): Port for the browser debugging protocol. Default: 9222.
         use_persistent_context (bool): Use a persistent browser context (like a persistent profile).
                                        Automatically sets use_managed_browser=True. Default: False.
@@ -402,6 +441,10 @@ class BrowserConfig:
         browser_mode: str = "dedicated",
         use_managed_browser: bool = False,
         cdp_url: str = None,
+        browser_context_id: str = None,
+        target_id: str = None,
+        cdp_cleanup_on_close: bool = False,
+        create_isolated_context: bool = False,
         use_persistent_context: bool = False,
         user_data_dir: str = None,
         chrome_channel: str = "chromium",
@@ -434,12 +477,18 @@ class BrowserConfig:
         debugging_port: int = 9222,
         host: str = "localhost",
         enable_stealth: bool = False,
+        init_scripts: List[str] = None,
     ):
+        
         self.browser_type = browser_type
-        self.headless = headless 
+        self.headless = headless
         self.browser_mode = browser_mode
         self.use_managed_browser = use_managed_browser
         self.cdp_url = cdp_url
+        self.browser_context_id = browser_context_id
+        self.target_id = target_id
+        self.cdp_cleanup_on_close = cdp_cleanup_on_close
+        self.create_isolated_context = create_isolated_context
         self.use_persistent_context = use_persistent_context
         self.user_data_dir = user_data_dir
         self.chrome_channel = chrome_channel or self.browser_type or "chromium"
@@ -447,13 +496,22 @@ class BrowserConfig:
         if self.browser_type in ["firefox", "webkit"]:
             self.channel = ""
             self.chrome_channel = ""
+        if proxy:
+            warnings.warn("The 'proxy' parameter is deprecated and will be removed in a future release. Use 'proxy_config' instead.", UserWarning)
         self.proxy = proxy
         self.proxy_config = proxy_config
         if isinstance(self.proxy_config, dict):
             self.proxy_config = ProxyConfig.from_dict(self.proxy_config)
         if isinstance(self.proxy_config, str):
             self.proxy_config = ProxyConfig.from_string(self.proxy_config)
-
+        
+        if self.proxy and self.proxy_config:
+            warnings.warn("Both 'proxy' and 'proxy_config' are provided. 'proxy_config' will take precedence.", UserWarning)
+            self.proxy = None
+        elif self.proxy:
+            # Convert proxy string to ProxyConfig if proxy_config is not provided
+            self.proxy_config = ProxyConfig.from_string(self.proxy)
+            self.proxy = None
 
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
@@ -479,6 +537,7 @@ class BrowserConfig:
         self.debugging_port = debugging_port
         self.host = host
         self.enable_stealth = enable_stealth
+        self.init_scripts = init_scripts if init_scripts is not None else []
 
         fa_user_agenr_generator = ValidUAGenerator()
         if self.user_agent_mode == "random":
@@ -526,6 +585,10 @@ class BrowserConfig:
             browser_mode=kwargs.get("browser_mode", "dedicated"),
             use_managed_browser=kwargs.get("use_managed_browser", False),
             cdp_url=kwargs.get("cdp_url"),
+            browser_context_id=kwargs.get("browser_context_id"),
+            target_id=kwargs.get("target_id"),
+            cdp_cleanup_on_close=kwargs.get("cdp_cleanup_on_close", False),
+            create_isolated_context=kwargs.get("create_isolated_context", False),
             use_persistent_context=kwargs.get("use_persistent_context", False),
             user_data_dir=kwargs.get("user_data_dir"),
             chrome_channel=kwargs.get("chrome_channel", "chromium"),
@@ -554,6 +617,7 @@ class BrowserConfig:
             debugging_port=kwargs.get("debugging_port", 9222),
             host=kwargs.get("host", "localhost"),
             enable_stealth=kwargs.get("enable_stealth", False),
+            init_scripts=kwargs.get("init_scripts", []),
         )
 
     def to_dict(self):
@@ -563,12 +627,16 @@ class BrowserConfig:
             "browser_mode": self.browser_mode,
             "use_managed_browser": self.use_managed_browser,
             "cdp_url": self.cdp_url,
+            "browser_context_id": self.browser_context_id,
+            "target_id": self.target_id,
+            "cdp_cleanup_on_close": self.cdp_cleanup_on_close,
+            "create_isolated_context": self.create_isolated_context,
             "use_persistent_context": self.use_persistent_context,
             "user_data_dir": self.user_data_dir,
             "chrome_channel": self.chrome_channel,
             "channel": self.channel,
             "proxy": self.proxy,
-            "proxy_config": self.proxy_config,
+            "proxy_config": self.proxy_config.to_dict() if self.proxy_config else None,
             "viewport_width": self.viewport_width,
             "viewport_height": self.viewport_height,
             "accept_downloads": self.accept_downloads,
@@ -589,9 +657,10 @@ class BrowserConfig:
             "debugging_port": self.debugging_port,
             "host": self.host,
             "enable_stealth": self.enable_stealth,
+            "init_scripts": self.init_scripts,
         }
 
-                
+
         return result
 
     def clone(self, **kwargs):
@@ -619,6 +688,85 @@ class BrowserConfig:
         if isinstance(config, BrowserConfig):
             return config
         return BrowserConfig.from_kwargs(config)
+
+    def set_nstproxy(
+        self,
+        token: str,
+        channel_id: str,
+        country: str = "ANY",
+        state: str = "",
+        city: str = "",
+        protocol: str = "http",
+        session_duration: int = 10,
+    ):
+        """
+        Fetch a proxy from NSTProxy API and automatically assign it to proxy_config.
+
+        Get your NSTProxy token from: https://app.nstproxy.com/profile
+
+        Args:
+            token (str): NSTProxy API token.
+            channel_id (str): NSTProxy channel ID.
+            country (str, optional): Country code (default: "ANY").
+            state (str, optional): State code (default: "").
+            city (str, optional): City name (default: "").
+            protocol (str, optional): Proxy protocol ("http" or "socks5"). Defaults to "http".
+            session_duration (int, optional): Session duration in minutes (0 = rotate each request). Defaults to 10.
+
+        Raises:
+            ValueError: If the API response format is invalid.
+            PermissionError: If the API returns an error message.
+        """
+
+        # --- Validate input early ---
+        if not token or not channel_id:
+            raise ValueError("[NSTProxy] token and channel_id are required")
+
+        if protocol not in ("http", "socks5"):
+            raise ValueError(f"[NSTProxy] Invalid protocol: {protocol}")
+
+        # --- Build NSTProxy API URL ---
+        params = {
+            "fType": 2,
+            "count": 1,
+            "channelId": channel_id,
+            "country": country,
+            "protocol": protocol,
+            "sessionDuration": session_duration,
+            "token": token,
+        }
+        if state:
+            params["state"] = state
+        if city:
+            params["city"] = city
+
+        url = "https://api.nstproxy.com/api/v1/generate/apiproxies"
+
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # --- Handle API error response ---
+            if isinstance(data, dict) and data.get("err"):
+                raise PermissionError(f"[NSTProxy] API Error: {data.get('msg', 'Unknown error')}")
+
+            if not isinstance(data, list) or not data:
+                raise ValueError("[NSTProxy] Invalid API response — expected a non-empty list")
+
+            proxy_info = data[0]
+
+            # --- Apply proxy config ---
+            self.proxy_config = ProxyConfig(
+                server=f"{protocol}://{proxy_info['ip']}:{proxy_info['port']}",
+                username=proxy_info["username"],
+                password=proxy_info["password"],
+            )
+
+        except Exception as e:
+            print(f"[NSTProxy] ❌ Failed to set proxy: {e}")
+            raise
 
 class VirtualScrollConfig:
     """Configuration for virtual scroll handling.
@@ -831,12 +979,6 @@ class HTTPCrawlerConfig:
         return HTTPCrawlerConfig.from_kwargs(config)
 
 class CrawlerRunConfig():
-    _UNWANTED_PROPS = {
-        'disable_cache' : 'Instead, use cache_mode=CacheMode.DISABLED',
-        'bypass_cache' : 'Instead, use cache_mode=CacheMode.BYPASS',
-        'no_cache_read' : 'Instead, use cache_mode=CacheMode.WRITE_ONLY',
-        'no_cache_write' : 'Instead, use cache_mode=CacheMode.READ_ONLY',
-    }
 
     """
     Configuration class for controlling how the crawler runs each crawl operation.
@@ -891,6 +1033,18 @@ class CrawlerRunConfig():
         proxy_config (ProxyConfig or dict or None): Detailed proxy configuration, e.g. {"server": "...", "username": "..."}.
                                      If None, no additional proxy config. Default: None.
 
+        # Sticky Proxy Session Parameters
+        proxy_session_id (str or None): When set, maintains the same proxy for all requests sharing this session ID.
+                                        The proxy is acquired on first request and reused for subsequent requests.
+                                        Session expires when explicitly released or crawler context is closed.
+                                        Default: None.
+        proxy_session_ttl (int or None): Time-to-live for sticky session in seconds.
+                                         After TTL expires, a new proxy is acquired on next request.
+                                         Default: None (session lasts until explicitly released or crawler closes).
+        proxy_session_auto_release (bool): If True, automatically release the proxy session after a batch operation.
+                                           Useful for arun_many() to clean up sessions automatically.
+                                           Default: False.
+
         # Browser Location and Identity Parameters
         locale (str or None): Locale to use for the browser context (e.g., "en-US").
                              Default: None.
@@ -918,6 +1072,15 @@ class CrawlerRunConfig():
                                Default: False.
         shared_data (dict or None): Shared data to be passed between hooks.
                                      Default: None.
+
+        # Cache Validation Parameters (Smart Cache)
+        check_cache_freshness (bool): If True, validates cached content freshness using HTTP
+                                      conditional requests (ETag/Last-Modified) and head fingerprinting
+                                      before returning cached results. Avoids full browser crawls when
+                                      content hasn't changed. Only applies when cache_mode allows reads.
+                                      Default: False.
+        cache_validation_timeout (float): Timeout in seconds for cache validation HTTP requests.
+                                          Default: 10.0.
 
         # Page Navigation and Timing Parameters
         wait_until (str): The condition to wait for when navigating, e.g. "domcontentloaded".
@@ -1025,6 +1188,12 @@ class CrawlerRunConfig():
         # Connection Parameters
         stream (bool): If True, enables streaming of crawled URLs as they are processed when used with arun_many.
                       Default: False.
+        process_in_browser (bool): If True, forces raw:/file:// URLs to be processed through the browser
+                                   pipeline (enabling js_code, wait_for, scrolling, etc.). When False (default),
+                                   raw:/file:// URLs use a fast path that returns HTML directly without browser
+                                   interaction. This is automatically enabled when browser-requiring parameters
+                                   are detected (js_code, wait_for, screenshot, pdf, etc.).
+                                   Default: False.
 
         check_robots_txt (bool): Whether to check robots.txt rules before crawling. Default: False
                                  Default: False.
@@ -1043,6 +1212,12 @@ class CrawlerRunConfig():
 
         url: str = None  # This is not a compulsory parameter
     """
+    _UNWANTED_PROPS = {
+        'disable_cache' : 'Instead, use cache_mode=CacheMode.DISABLED',
+        'bypass_cache' : 'Instead, use cache_mode=CacheMode.BYPASS',
+        'no_cache_read' : 'Instead, use cache_mode=CacheMode.WRITE_ONLY',
+        'no_cache_write' : 'Instead, use cache_mode=CacheMode.READ_ONLY',
+    }
 
     def __init__(
         self,
@@ -1064,6 +1239,10 @@ class CrawlerRunConfig():
         scraping_strategy: ContentScrapingStrategy = None,
         proxy_config: Union[ProxyConfig, dict, None] = None,
         proxy_rotation_strategy: Optional[ProxyRotationStrategy] = None,
+        # Sticky Proxy Session Parameters
+        proxy_session_id: Optional[str] = None,
+        proxy_session_ttl: Optional[int] = None,
+        proxy_session_auto_release: bool = False,
         # Browser Location and Identity Parameters
         locale: Optional[str] = None,
         timezone_id: Optional[str] = None,
@@ -1078,6 +1257,9 @@ class CrawlerRunConfig():
         no_cache_read: bool = False,
         no_cache_write: bool = False,
         shared_data: dict = None,
+        # Cache Validation Parameters (Smart Cache)
+        check_cache_freshness: bool = False,
+        cache_validation_timeout: float = 10.0,
         # Page Navigation and Timing Parameters
         wait_until: str = "domcontentloaded",
         page_timeout: int = PAGE_TIMEOUT,
@@ -1121,6 +1303,7 @@ class CrawlerRunConfig():
         exclude_domains: list = None,
         exclude_internal_links: bool = False,
         score_links: bool = False,
+        preserve_https_for_internal_links: bool = False,
         # Debugging and Logging Parameters
         verbose: bool = True,
         log_console: bool = False,
@@ -1130,7 +1313,10 @@ class CrawlerRunConfig():
         # Connection Parameters
         method: str = "GET",
         stream: bool = False,
+        prefetch: bool = False,  # When True, return only HTML + links (skip heavy processing)
+        process_in_browser: bool = False,  # Force browser processing for raw:/file:// URLs
         url: str = None,
+        base_url: str = None,  # Base URL for markdown link resolution (used with raw: HTML)
         check_robots_txt: bool = False,
         user_agent: str = None,
         user_agent_mode: str = None,
@@ -1149,6 +1335,7 @@ class CrawlerRunConfig():
     ):
         # TODO: Planning to set properties dynamically based on the __init__ signature
         self.url = url
+        self.base_url = base_url  # Base URL for markdown link resolution
 
         # Content Processing Parameters
         self.word_count_threshold = word_count_threshold
@@ -1173,7 +1360,12 @@ class CrawlerRunConfig():
             self.proxy_config = ProxyConfig.from_string(proxy_config)
 
         self.proxy_rotation_strategy = proxy_rotation_strategy
-        
+
+        # Sticky Proxy Session Parameters
+        self.proxy_session_id = proxy_session_id
+        self.proxy_session_ttl = proxy_session_ttl
+        self.proxy_session_auto_release = proxy_session_auto_release
+
         # Browser Location and Identity Parameters
         self.locale = locale
         self.timezone_id = timezone_id
@@ -1190,6 +1382,9 @@ class CrawlerRunConfig():
         self.no_cache_read = no_cache_read
         self.no_cache_write = no_cache_write
         self.shared_data = shared_data
+        # Cache Validation (Smart Cache)
+        self.check_cache_freshness = check_cache_freshness
+        self.cache_validation_timeout = cache_validation_timeout
 
         # Page Navigation and Timing Parameters
         self.wait_until = wait_until
@@ -1244,6 +1439,7 @@ class CrawlerRunConfig():
         self.exclude_domains = exclude_domains or []
         self.exclude_internal_links = exclude_internal_links
         self.score_links = score_links
+        self.preserve_https_for_internal_links = preserve_https_for_internal_links
 
         # Debugging and Logging Parameters
         self.verbose = verbose
@@ -1255,6 +1451,8 @@ class CrawlerRunConfig():
 
         # Connection Parameters
         self.stream = stream
+        self.prefetch = prefetch  # Prefetch mode: return only HTML + links
+        self.process_in_browser = process_in_browser  # Force browser processing for raw:/file:// URLs
         self.method = method
 
         # Robots.txt Handling Parameters
@@ -1452,6 +1650,10 @@ class CrawlerRunConfig():
             scraping_strategy=kwargs.get("scraping_strategy"),
             proxy_config=kwargs.get("proxy_config"),
             proxy_rotation_strategy=kwargs.get("proxy_rotation_strategy"),
+            # Sticky Proxy Session Parameters
+            proxy_session_id=kwargs.get("proxy_session_id"),
+            proxy_session_ttl=kwargs.get("proxy_session_ttl"),
+            proxy_session_auto_release=kwargs.get("proxy_session_auto_release", False),
             # Browser Location and Identity Parameters
             locale=kwargs.get("locale", None),
             timezone_id=kwargs.get("timezone_id", None),
@@ -1517,6 +1719,7 @@ class CrawlerRunConfig():
             exclude_domains=kwargs.get("exclude_domains", []),
             exclude_internal_links=kwargs.get("exclude_internal_links", False),
             score_links=kwargs.get("score_links", False),
+            preserve_https_for_internal_links=kwargs.get("preserve_https_for_internal_links", False),
             # Debugging and Logging Parameters
             verbose=kwargs.get("verbose", True),
             log_console=kwargs.get("log_console", False),
@@ -1526,6 +1729,8 @@ class CrawlerRunConfig():
             # Connection Parameters
             method=kwargs.get("method", "GET"),
             stream=kwargs.get("stream", False),
+            prefetch=kwargs.get("prefetch", False),
+            process_in_browser=kwargs.get("process_in_browser", False),
             check_robots_txt=kwargs.get("check_robots_txt", False),
             user_agent=kwargs.get("user_agent"),
             user_agent_mode=kwargs.get("user_agent_mode"),
@@ -1535,6 +1740,7 @@ class CrawlerRunConfig():
             # Link Extraction Parameters
             link_preview_config=kwargs.get("link_preview_config"),
             url=kwargs.get("url"),
+            base_url=kwargs.get("base_url"),
             # URL Matching Parameters
             url_matcher=kwargs.get("url_matcher"),
             match_mode=kwargs.get("match_mode", MatchMode.OR),
@@ -1574,6 +1780,9 @@ class CrawlerRunConfig():
             "scraping_strategy": self.scraping_strategy,
             "proxy_config": self.proxy_config,
             "proxy_rotation_strategy": self.proxy_rotation_strategy,
+            "proxy_session_id": self.proxy_session_id,
+            "proxy_session_ttl": self.proxy_session_ttl,
+            "proxy_session_auto_release": self.proxy_session_auto_release,
             "locale": self.locale,
             "timezone_id": self.timezone_id,
             "geolocation": self.geolocation,
@@ -1623,12 +1832,15 @@ class CrawlerRunConfig():
             "exclude_domains": self.exclude_domains,
             "exclude_internal_links": self.exclude_internal_links,
             "score_links": self.score_links,
+            "preserve_https_for_internal_links": self.preserve_https_for_internal_links,
             "verbose": self.verbose,
             "log_console": self.log_console,
             "capture_network_requests": self.capture_network_requests,
             "capture_console_messages": self.capture_console_messages,
             "method": self.method,
             "stream": self.stream,
+            "prefetch": self.prefetch,
+            "process_in_browser": self.process_in_browser,
             "check_robots_txt": self.check_robots_txt,
             "user_agent": self.user_agent,
             "user_agent_mode": self.user_agent_mode,
@@ -1679,7 +1891,10 @@ class LLMConfig:
         frequency_penalty: Optional[float] = None,
         presence_penalty: Optional[float] = None,
         stop: Optional[List[str]] = None,
-        n: Optional[int] = None,    
+        n: Optional[int] = None,
+        backoff_base_delay: Optional[int] = None,
+        backoff_max_attempts: Optional[int] = None,
+        backoff_exponential_factor: Optional[int] = None,
     ):
         """Configuaration class for LLM provider and API token."""
         self.provider = provider
@@ -1708,6 +1923,9 @@ class LLMConfig:
         self.presence_penalty = presence_penalty
         self.stop = stop
         self.n = n
+        self.backoff_base_delay = backoff_base_delay if backoff_base_delay is not None else 2
+        self.backoff_max_attempts = backoff_max_attempts if backoff_max_attempts is not None else 3
+        self.backoff_exponential_factor = backoff_exponential_factor if backoff_exponential_factor is not None else 2
 
     @staticmethod
     def from_kwargs(kwargs: dict) -> "LLMConfig":
@@ -1721,7 +1939,10 @@ class LLMConfig:
             frequency_penalty=kwargs.get("frequency_penalty"),
             presence_penalty=kwargs.get("presence_penalty"),
             stop=kwargs.get("stop"),
-            n=kwargs.get("n")
+            n=kwargs.get("n"),
+            backoff_base_delay=kwargs.get("backoff_base_delay"),
+            backoff_max_attempts=kwargs.get("backoff_max_attempts"),
+            backoff_exponential_factor=kwargs.get("backoff_exponential_factor")
         )
 
     def to_dict(self):
@@ -1735,7 +1956,10 @@ class LLMConfig:
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
             "stop": self.stop,
-            "n": self.n
+            "n": self.n,
+            "backoff_base_delay": self.backoff_base_delay,
+            "backoff_max_attempts": self.backoff_max_attempts,
+            "backoff_exponential_factor": self.backoff_exponential_factor
         }
 
     def clone(self, **kwargs):
@@ -1772,6 +1996,8 @@ class SeedingConfig:
         score_threshold: Optional[float] = None,
         scoring_method: str = "bm25",
         filter_nonsense_urls: bool = True,
+        cache_ttl_hours: int = 24,
+        validate_sitemap_lastmod: bool = True,
     ):
         """
         Initialize URL seeding configuration.
@@ -1803,10 +2029,14 @@ class SeedingConfig:
                   Requires extract_head=True. Default: None
             score_threshold: Minimum relevance score (0.0-1.0) to include URL. 
                            Only applies when query is provided. Default: None
-            scoring_method: Scoring algorithm to use. Currently only "bm25" is supported. 
+            scoring_method: Scoring algorithm to use. Currently only "bm25" is supported.
                           Future: "semantic". Default: "bm25"
-            filter_nonsense_urls: Filter out utility URLs like robots.txt, sitemap.xml, 
+            filter_nonsense_urls: Filter out utility URLs like robots.txt, sitemap.xml,
                                  ads.txt, favicon.ico, etc. Default: True
+            cache_ttl_hours: Hours before sitemap cache expires. Set to 0 to disable TTL
+                            (only lastmod validation). Default: 24
+            validate_sitemap_lastmod: If True, compares sitemap's <lastmod> with cache
+                                     timestamp and refetches if sitemap is newer. Default: True
         """
         self.source = source
         self.pattern = pattern
@@ -1823,6 +2053,8 @@ class SeedingConfig:
         self.score_threshold = score_threshold
         self.scoring_method = scoring_method
         self.filter_nonsense_urls = filter_nonsense_urls
+        self.cache_ttl_hours = cache_ttl_hours
+        self.validate_sitemap_lastmod = validate_sitemap_lastmod
 
     # Add to_dict, from_kwargs, and clone methods for consistency
     def to_dict(self) -> Dict[str, Any]:

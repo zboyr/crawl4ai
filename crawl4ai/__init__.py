@@ -72,6 +72,8 @@ from .deep_crawling import (
     BestFirstCrawlingStrategy,
     DFSDeepCrawlStrategy,
     DeepCrawlDecorator,
+    ContentRelevanceFilter,
+    ContentTypeScorer,
 )
 # NEW: Import AsyncUrlSeeder
 from .async_url_seeder import AsyncUrlSeeder
@@ -103,7 +105,8 @@ from .browser_adapter import (
 
 from .utils import (
     start_colab_display_server,
-    setup_colab_environment
+    setup_colab_environment,
+    hooks_to_string
 )
 
 __all__ = [
@@ -183,6 +186,7 @@ __all__ = [
     "ProxyConfig",
     "start_colab_display_server",
     "setup_colab_environment",
+    "hooks_to_string",
     # C4A Script additions
     "c4a_compile",
     "c4a_validate", 

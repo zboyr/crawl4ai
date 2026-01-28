@@ -18,7 +18,7 @@ from collections import defaultdict
 import re
 from pathlib import Path
 from crawl4ai.async_webcrawler import AsyncWebCrawler
-from crawl4ai.async_configs import CrawlerRunConfig, LinkPreviewConfig
+from crawl4ai.async_configs import CrawlerRunConfig, LinkPreviewConfig, LLMConfig
 from crawl4ai.models import Link, CrawlResult
 import numpy as np
 
@@ -179,7 +179,7 @@ class AdaptiveConfig:
     
     # Embedding strategy parameters
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_llm_config: Optional[Dict] = None  # Separate config for embeddings
+    embedding_llm_config: Optional[Union[LLMConfig, Dict]] = None  # Separate config for embeddings
     n_query_variations: int = 10
     coverage_threshold: float = 0.85
     alpha_shape_alpha: float = 0.5
@@ -251,6 +251,30 @@ class AdaptiveConfig:
         assert 0 <= self.embedding_quality_max_confidence <= 1, "embedding_quality_max_confidence must be between 0 and 1"
         assert self.embedding_quality_scale_factor > 0, "embedding_quality_scale_factor must be positive"
         assert 0 <= self.embedding_min_confidence_threshold <= 1, "embedding_min_confidence_threshold must be between 0 and 1"
+    
+    @property
+    def _embedding_llm_config_dict(self) -> Optional[Dict]:
+        """Convert LLMConfig to dict format for backward compatibility."""
+        if self.embedding_llm_config is None:
+            return None
+        
+        if isinstance(self.embedding_llm_config, dict):
+            # Already a dict - return as-is for backward compatibility
+            return self.embedding_llm_config
+        
+        # Convert LLMConfig object to dict format
+        return {
+            'provider': self.embedding_llm_config.provider,
+            'api_token': self.embedding_llm_config.api_token,
+            'base_url': getattr(self.embedding_llm_config, 'base_url', None),
+            'temperature': getattr(self.embedding_llm_config, 'temperature', None),
+            'max_tokens': getattr(self.embedding_llm_config, 'max_tokens', None),
+            'top_p': getattr(self.embedding_llm_config, 'top_p', None),
+            'frequency_penalty': getattr(self.embedding_llm_config, 'frequency_penalty', None),
+            'presence_penalty': getattr(self.embedding_llm_config, 'presence_penalty', None),
+            'stop': getattr(self.embedding_llm_config, 'stop', None),
+            'n': getattr(self.embedding_llm_config, 'n', None),
+        }
 
 
 class CrawlStrategy(ABC):
@@ -594,7 +618,7 @@ class StatisticalStrategy(CrawlStrategy):
 class EmbeddingStrategy(CrawlStrategy):
     """Embedding-based adaptive crawling using semantic space coverage"""
     
-    def __init__(self, logger, embedding_model: str = None, llm_config: Dict = None, exclude_pattern: Pattern[str] = None):
+    def __init__(self, logger, embedding_model: str = None, llm_config: Union[LLMConfig, Dict] = None, exclude_pattern: Pattern[str] = None):
         self.embedding_model = embedding_model or "sentence-transformers/all-MiniLM-L6-v2"
         self.llm_config = llm_config
         self._embedding_cache = {}
@@ -607,14 +631,24 @@ class EmbeddingStrategy(CrawlStrategy):
         self._kb_embeddings_hash = None  # Track KB changes
         self._validation_embeddings_cache = None  # Cache validation query embeddings
         self._kb_similarity_threshold = 0.95  # Threshold for deduplication
+    
+    def _get_embedding_llm_config_dict(self) -> Dict:
+        """Get embedding LLM config as dict with fallback to default."""
+        if hasattr(self, 'config') and self.config:
+            config_dict = self.config._embedding_llm_config_dict
+            if config_dict:
+                return config_dict
+        
+        # Fallback to default if no config provided
+        return {
+            'provider': 'openai/text-embedding-3-small',
+            'api_token': os.getenv('OPENAI_API_KEY')
+        }
         
     async def _get_embeddings(self, texts: List[str]) -> Any:
         """Get embeddings using configured method"""
         from .utils import get_text_embeddings
-        embedding_llm_config = {
-            'provider': 'openai/text-embedding-3-small',
-            'api_token': os.getenv('OPENAI_API_KEY')
-        }
+        embedding_llm_config = self._get_embedding_llm_config_dict()
         return await get_text_embeddings(
             texts, 
             embedding_llm_config,
@@ -850,10 +884,7 @@ class EmbeddingStrategy(CrawlStrategy):
         
         # Batch embed only uncached links
         if texts_to_embed:
-            embedding_llm_config = {
-                'provider': 'openai/text-embedding-3-small',
-                'api_token': os.getenv('OPENAI_API_KEY')
-            }
+            embedding_llm_config = self._get_embedding_llm_config_dict()
             new_embeddings = await get_text_embeddings(texts_to_embed, embedding_llm_config, self.embedding_model)
 
             # Cache the new embeddings
@@ -1191,10 +1222,7 @@ class EmbeddingStrategy(CrawlStrategy):
             return
             
         # Get embeddings for new texts
-        embedding_llm_config = {
-            'provider': 'openai/text-embedding-3-small',
-            'api_token': os.getenv('OPENAI_API_KEY')
-        }        
+        embedding_llm_config = self._get_embedding_llm_config_dict()      
         new_embeddings = await get_text_embeddings(new_texts, embedding_llm_config, self.embedding_model)
 
         # Deduplicate embeddings before adding to KB
@@ -1266,12 +1294,13 @@ class AdaptiveCrawler:
         if strategy_name == "statistical":
             return StatisticalStrategy()
         elif strategy_name == "embedding":
-            return EmbeddingStrategy(
-                logger=self.crawler.logger,
+            strategy = EmbeddingStrategy(
                 embedding_model=self.config.embedding_model,
                 llm_config=self.config.embedding_llm_config,
                 exclude_pattern=self.exclude_pattern
             )
+            strategy.config = self.config  # Pass config to strategy
+            return strategy
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
     

@@ -94,6 +94,20 @@ class ExtractionStrategy(ABC):
                 extracted_content.extend(future.result())
         return extracted_content
 
+    async def arun(self, url: str, sections: List[str], *q, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Async version: Process sections of text in parallel using asyncio.
+
+        Default implementation runs the sync version in a thread pool.
+        Subclasses can override this for true async processing.
+
+        :param url: The URL of the webpage.
+        :param sections: List of sections (strings) to process.
+        :return: A list of processed JSON blocks.
+        """
+        import asyncio
+        return await asyncio.to_thread(self.run, url, sections, *q, **kwargs)
+
 
 class NoExtractionStrategy(ExtractionStrategy):
     """
@@ -635,6 +649,9 @@ class LLMExtractionStrategy(ExtractionStrategy):
                 base_url=self.llm_config.base_url,
                 json_response=self.force_json_response,
                 extra_args=self.extra_args,
+                base_delay=self.llm_config.backoff_base_delay,
+                max_attempts=self.llm_config.backoff_max_attempts,
+                exponential_factor=self.llm_config.backoff_exponential_factor
             )  # , json_response=self.extract_type == "schema")
             # Track usage
             usage = TokenUsage(
@@ -777,6 +794,180 @@ class LLMExtractionStrategy(ExtractionStrategy):
                                 "content": str(e),
                             }
                         )
+
+        return extracted_content
+
+    async def aextract(self, url: str, ix: int, html: str) -> List[Dict[str, Any]]:
+        """
+        Async version: Extract meaningful blocks or chunks from the given HTML using an LLM.
+
+        How it works:
+        1. Construct a prompt with variables.
+        2. Make an async request to the LLM using the prompt.
+        3. Parse the response and extract blocks or chunks.
+
+        Args:
+            url: The URL of the webpage.
+            ix: Index of the block.
+            html: The HTML content of the webpage.
+
+        Returns:
+            A list of extracted blocks or chunks.
+        """
+        from .utils import aperform_completion_with_backoff
+
+        if self.verbose:
+            print(f"[LOG] Call LLM for {url} - block index: {ix}")
+
+        variable_values = {
+            "URL": url,
+            "HTML": escape_json_string(sanitize_html(html)),
+        }
+
+        prompt_with_variables = PROMPT_EXTRACT_BLOCKS
+        if self.instruction:
+            variable_values["REQUEST"] = self.instruction
+            prompt_with_variables = PROMPT_EXTRACT_BLOCKS_WITH_INSTRUCTION
+
+        if self.extract_type == "schema" and self.schema:
+            variable_values["SCHEMA"] = json.dumps(self.schema, indent=2)
+            prompt_with_variables = PROMPT_EXTRACT_SCHEMA_WITH_INSTRUCTION
+
+        if self.extract_type == "schema" and not self.schema:
+            prompt_with_variables = PROMPT_EXTRACT_INFERRED_SCHEMA
+
+        for variable in variable_values:
+            prompt_with_variables = prompt_with_variables.replace(
+                "{" + variable + "}", variable_values[variable]
+            )
+
+        try:
+            response = await aperform_completion_with_backoff(
+                self.llm_config.provider,
+                prompt_with_variables,
+                self.llm_config.api_token,
+                base_url=self.llm_config.base_url,
+                json_response=self.force_json_response,
+                extra_args=self.extra_args,
+                base_delay=self.llm_config.backoff_base_delay,
+                max_attempts=self.llm_config.backoff_max_attempts,
+                exponential_factor=self.llm_config.backoff_exponential_factor
+            )
+            # Track usage
+            usage = TokenUsage(
+                completion_tokens=response.usage.completion_tokens,
+                prompt_tokens=response.usage.prompt_tokens,
+                total_tokens=response.usage.total_tokens,
+                completion_tokens_details=response.usage.completion_tokens_details.__dict__
+                if response.usage.completion_tokens_details
+                else {},
+                prompt_tokens_details=response.usage.prompt_tokens_details.__dict__
+                if response.usage.prompt_tokens_details
+                else {},
+            )
+            self.usages.append(usage)
+
+            # Update totals
+            self.total_usage.completion_tokens += usage.completion_tokens
+            self.total_usage.prompt_tokens += usage.prompt_tokens
+            self.total_usage.total_tokens += usage.total_tokens
+
+            try:
+                content = response.choices[0].message.content
+                blocks = None
+
+                if self.force_json_response:
+                    blocks = json.loads(content)
+                    if isinstance(blocks, dict):
+                        if len(blocks) == 1 and isinstance(list(blocks.values())[0], list):
+                            blocks = list(blocks.values())[0]
+                        else:
+                            blocks = [blocks]
+                    elif isinstance(blocks, list):
+                        blocks = blocks
+                else:
+                    blocks = extract_xml_data(["blocks"], content)["blocks"]
+                    blocks = json.loads(blocks)
+
+                for block in blocks:
+                    block["error"] = False
+            except Exception:
+                parsed, unparsed = split_and_parse_json_objects(
+                    response.choices[0].message.content
+                )
+                blocks = parsed
+                if unparsed:
+                    blocks.append(
+                        {"index": 0, "error": True, "tags": ["error"], "content": unparsed}
+                    )
+
+            if self.verbose:
+                print(
+                    "[LOG] Extracted",
+                    len(blocks),
+                    "blocks from URL:",
+                    url,
+                    "block index:",
+                    ix,
+                )
+            return blocks
+        except Exception as e:
+            if self.verbose:
+                print(f"[LOG] Error in LLM extraction: {e}")
+            return [
+                {
+                    "index": ix,
+                    "error": True,
+                    "tags": ["error"],
+                    "content": str(e),
+                }
+            ]
+
+    async def arun(self, url: str, sections: List[str]) -> List[Dict[str, Any]]:
+        """
+        Async version: Process sections with true parallelism using asyncio.gather.
+
+        Args:
+            url: The URL of the webpage.
+            sections: List of sections (strings) to process.
+
+        Returns:
+            A list of extracted blocks or chunks.
+        """
+        import asyncio
+
+        merged_sections = self._merge(
+            sections,
+            self.chunk_token_threshold,
+            overlap=int(self.chunk_token_threshold * self.overlap_rate),
+        )
+
+        extracted_content = []
+
+        # Create tasks for all sections to run in parallel
+        tasks = [
+            self.aextract(url, ix, sanitize_input_encode(section))
+            for ix, section in enumerate(merged_sections)
+        ]
+
+        # Execute all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for result in results:
+            if isinstance(result, Exception):
+                if self.verbose:
+                    print(f"Error in async extraction: {result}")
+                extracted_content.append(
+                    {
+                        "index": 0,
+                        "error": True,
+                        "tags": ["error"],
+                        "content": str(result),
+                    }
+                )
+            else:
+                extracted_content.extend(result)
 
         return extracted_content
 
@@ -1086,44 +1277,18 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
     }
 
     @staticmethod
-    def generate_schema(
-        html: str,
-        schema_type: str = "CSS", # or XPATH
-        query: str = None,
-        target_json_example: str = None,
-        llm_config: 'LLMConfig' = create_llm_config(),
-        provider: str = None,
-        api_token: str = None,
-        **kwargs
-    ) -> dict:
+    def _build_schema_prompt(html: str, schema_type: str, query: str = None, target_json_example: str = None) -> str:
         """
-        Generate extraction schema from HTML content and optional query.
-        
-        Args:
-            html (str): The HTML content to analyze
-            query (str, optional): Natural language description of what data to extract
-            provider (str): Legacy Parameter. LLM provider to use 
-            api_token (str): Legacy Parameter. API token for LLM provider
-            llm_config (LLMConfig): LLM configuration object
-            prompt (str, optional): Custom prompt template to use
-            **kwargs: Additional args passed to LLM processor
-            
+        Build the prompt for schema generation. Shared by sync and async methods.
+
         Returns:
-            dict: Generated schema following the JsonElementExtractionStrategy format
+            str: Combined system and user prompt
         """
         from .prompts import JSON_SCHEMA_BUILDER
-        from .utils import perform_completion_with_backoff
-        for name, message in JsonElementExtractionStrategy._GENERATE_SCHEMA_UNWANTED_PROPS.items():
-            if locals()[name] is not None:
-                raise AttributeError(f"Setting '{name}' is deprecated. {message}")
-        
-        # Use default or custom prompt
+
         prompt_template = JSON_SCHEMA_BUILDER if schema_type == "CSS" else JSON_SCHEMA_BUILDER_XPATH
-        
-        # Build the prompt
-        system_message = {
-            "role": "system", 
-            "content": f"""You specialize in generating special JSON schemas for web scraping. This schema uses CSS or XPATH selectors to present a repetitive pattern in crawled HTML, such as a product in a product list or a search result item in a list of search results. We use this JSON schema to pass to a language model along with the HTML content to extract structured data from the HTML. The language model uses the JSON schema to extract data from the HTML and retrieve values for fields in the JSON schema, following the schema.
+
+        system_content = f"""You specialize in generating special JSON schemas for web scraping. This schema uses CSS or XPATH selectors to present a repetitive pattern in crawled HTML, such as a product in a product list or a search result item in a list of search results. We use this JSON schema to pass to a language model along with the HTML content to extract structured data from the HTML. The language model uses the JSON schema to extract data from the HTML and retrieve values for fields in the JSON schema, following the schema.
 
 Generating this HTML manually is not feasible, so you need to generate the JSON schema using the HTML content. The HTML copied from the crawled website is provided below, which we believe contains the repetitive pattern.
 
@@ -1144,31 +1309,27 @@ In this scenario, use your best judgment to generate the schema. You need to exa
 
 # What are the instructions and details for this schema generation?
 {prompt_template}"""
-        }
-        
-        user_message = {
-            "role": "user",
-            "content": f"""
+
+        user_content = f"""
                 HTML to analyze:
                 ```html
                 {html}
                 ```
                 """
-        }
 
         if query:
-            user_message["content"] += f"\n\n## Query or explanation of target/goal data item:\n{query}"
+            user_content += f"\n\n## Query or explanation of target/goal data item:\n{query}"
         if target_json_example:
-            user_message["content"] += f"\n\n## Example of target JSON object:\n```json\n{target_json_example}\n```"
+            user_content += f"\n\n## Example of target JSON object:\n```json\n{target_json_example}\n```"
 
         if query and not target_json_example:
-            user_message["content"] += """IMPORTANT: To remind you, in this process, we are not providing a rigid example of the adjacent objects we seek. We rely on your understanding of the explanation provided in the above section. Make sure to grasp what we are looking for and, based on that, create the best schema.."""
+            user_content += """IMPORTANT: To remind you, in this process, we are not providing a rigid example of the adjacent objects we seek. We rely on your understanding of the explanation provided in the above section. Make sure to grasp what we are looking for and, based on that, create the best schema.."""
         elif not query and target_json_example:
-            user_message["content"] += """IMPORTANT: Please remember that in this process, we provided a proper example of a target JSON object. Make sure to adhere to the structure and create a schema that exactly fits this example. If you find that some elements on the page do not match completely, vote for the majority."""
+            user_content += """IMPORTANT: Please remember that in this process, we provided a proper example of a target JSON object. Make sure to adhere to the structure and create a schema that exactly fits this example. If you find that some elements on the page do not match completely, vote for the majority."""
         elif not query and not target_json_example:
-            user_message["content"] += """IMPORTANT: Since we neither have a query nor an example, it is crucial to rely solely on the HTML content provided. Leverage your expertise to determine the schema based on the repetitive patterns observed in the content."""
-        
-        user_message["content"] += """IMPORTANT: 
+            user_content += """IMPORTANT: Since we neither have a query nor an example, it is crucial to rely solely on the HTML content provided. Leverage your expertise to determine the schema based on the repetitive patterns observed in the content."""
+
+        user_content += """IMPORTANT:
         0/ Ensure your schema remains reliable by avoiding selectors that appear to generate dynamically and are not dependable. You want a reliable schema, as it consistently returns the same data even after many page reloads.
         1/ DO NOT USE use base64 kind of classes, they are temporary and not reliable.
         2/ Every selector must refer to only one unique element. You should ensure your selector points to a single element and is unique to the place that contains the information. You have to use available techniques based on CSS or XPATH requested schema to make sure your selector is unique and also not fragile, meaning if we reload the page now or in the future, the selector should remain reliable.
@@ -1177,20 +1338,98 @@ In this scenario, use your best judgment to generate the schema. You need to exa
         Analyze the HTML and generate a JSON schema that follows the specified format. Only output valid JSON schema, nothing else.
         """
 
+        return "\n\n".join([system_content, user_content])
+
+    @staticmethod
+    def generate_schema(
+        html: str,
+        schema_type: str = "CSS",
+        query: str = None,
+        target_json_example: str = None,
+        llm_config: 'LLMConfig' = create_llm_config(),
+        provider: str = None,
+        api_token: str = None,
+        **kwargs
+    ) -> dict:
+        """
+        Generate extraction schema from HTML content and optional query (sync version).
+
+        Args:
+            html (str): The HTML content to analyze
+            query (str, optional): Natural language description of what data to extract
+            provider (str): Legacy Parameter. LLM provider to use
+            api_token (str): Legacy Parameter. API token for LLM provider
+            llm_config (LLMConfig): LLM configuration object
+            **kwargs: Additional args passed to LLM processor
+
+        Returns:
+            dict: Generated schema following the JsonElementExtractionStrategy format
+        """
+        from .utils import perform_completion_with_backoff
+
+        for name, message in JsonElementExtractionStrategy._GENERATE_SCHEMA_UNWANTED_PROPS.items():
+            if locals()[name] is not None:
+                raise AttributeError(f"Setting '{name}' is deprecated. {message}")
+
+        prompt = JsonElementExtractionStrategy._build_schema_prompt(html, schema_type, query, target_json_example)
+
         try:
-            # Call LLM with backoff handling
             response = perform_completion_with_backoff(
                 provider=llm_config.provider,
-                prompt_with_variables="\n\n".join([system_message["content"], user_message["content"]]),
-                json_response = True,                
+                prompt_with_variables=prompt,
+                json_response=True,
                 api_token=llm_config.api_token,
                 base_url=llm_config.base_url,
                 extra_args=kwargs
             )
-            
-            # Extract and return schema
             return json.loads(response.choices[0].message.content)
-            
+        except Exception as e:
+            raise Exception(f"Failed to generate schema: {str(e)}")
+
+    @staticmethod
+    async def agenerate_schema(
+        html: str,
+        schema_type: str = "CSS",
+        query: str = None,
+        target_json_example: str = None,
+        llm_config: 'LLMConfig' = None,
+        **kwargs
+    ) -> dict:
+        """
+        Generate extraction schema from HTML content (async version).
+
+        Use this method when calling from async contexts (e.g., FastAPI) to avoid
+        issues with certain LLM providers (e.g., Gemini/Vertex AI) that require
+        async execution.
+
+        Args:
+            html (str): The HTML content to analyze
+            schema_type (str): "CSS" or "XPATH"
+            query (str, optional): Natural language description of what data to extract
+            target_json_example (str, optional): Example of desired JSON output
+            llm_config (LLMConfig): LLM configuration object
+            **kwargs: Additional args passed to LLM processor
+
+        Returns:
+            dict: Generated schema following the JsonElementExtractionStrategy format
+        """
+        from .utils import aperform_completion_with_backoff
+
+        if llm_config is None:
+            llm_config = create_llm_config()
+
+        prompt = JsonElementExtractionStrategy._build_schema_prompt(html, schema_type, query, target_json_example)
+
+        try:
+            response = await aperform_completion_with_backoff(
+                provider=llm_config.provider,
+                prompt_with_variables=prompt,
+                json_response=True,
+                api_token=llm_config.api_token,
+                base_url=llm_config.base_url,
+                extra_args=kwargs
+            )
+            return json.loads(response.choices[0].message.content)
         except Exception as e:
             raise Exception(f"Failed to generate schema: {str(e)}")
 

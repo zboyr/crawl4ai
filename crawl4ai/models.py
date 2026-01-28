@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl, PrivateAttr, Field
+from pydantic import BaseModel, HttpUrl, PrivateAttr, Field, ConfigDict
 from typing import List, Dict, Optional, Callable, Awaitable, Union, Any
 from typing import AsyncGenerator
 from typing import Generic, TypeVar
@@ -152,9 +152,12 @@ class CrawlResult(BaseModel):
     network_requests: Optional[List[Dict[str, Any]]] = None
     console_messages: Optional[List[Dict[str, Any]]] = None
     tables: List[Dict] = Field(default_factory=list)  # NEW – [{headers,rows,caption,summary}]
+    # Cache validation metadata (Smart Cache)
+    head_fingerprint: Optional[str] = None
+    cached_at: Optional[float] = None
+    cache_status: Optional[str] = None  # "hit", "hit_validated", "hit_fallback", "miss"
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 # NOTE: The StringCompatibleMarkdown class, custom __init__ method, property getters/setters,
 # and model_dump override all exist to support a smooth transition from markdown as a string
@@ -253,6 +256,16 @@ class CrawlResult(BaseModel):
         requirements change, this is where you would update the logic.
         """
         result = super().model_dump(*args, **kwargs)
+        
+        # Remove any property descriptors that might have been included
+        # These deprecated properties should not be in the serialized output
+        for key in ['fit_html', 'fit_markdown', 'markdown_v2']:
+            if key in result and isinstance(result[key], property):
+                # del result[key]
+                # Nasrin: I decided to convert it to string instead of removing it.
+                result[key] = str(result[key])
+        
+        # Add the markdown field properly
         if self._markdown is not None:
             result["markdown"] = self._markdown.model_dump() 
         return result
@@ -322,8 +335,7 @@ class AsyncCrawlResponse(BaseModel):
     network_requests: Optional[List[Dict[str, Any]]] = None
     console_messages: Optional[List[Dict[str, Any]]] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 ###############################
 # Scraping Models
